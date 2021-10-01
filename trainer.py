@@ -1,4 +1,3 @@
-import copy
 import time
 
 import numpy
@@ -15,8 +14,9 @@ class Trainer:
     in the shared storage.
     """
 
-    def __init__(self, initial_checkpoint, config):
+    def __init__(self, initial_weights, config):
         self.config = config
+        self.training_step = 0
 
         # Fix random generator seed
         numpy.random.seed(self.config.seed)
@@ -24,16 +24,10 @@ class Trainer:
 
         # Initialize the network
         self.model = models.MuZeroNetwork(self.config)
-        self.model.set_weights(copy.deepcopy(initial_checkpoint["weights"]))
-        self.model.to(torch.device("cuda" if self.config.train_on_gpu else "cpu"))
+        self.model.set_weights(initial_weights)
+        self.model.to(torch.device(config.training_device))
         self.model.train()
 
-        self.training_step = initial_checkpoint["training_step"]
-
-        if "cuda" not in str(next(self.model.parameters()).device):
-            print("You are not training on GPU.\n")
-
-        # Initialize the optimizer
         if self.config.optimizer == "SGD":
             self.optimizer = torch.optim.SGD(
                 self.model.parameters(),
@@ -48,28 +42,20 @@ class Trainer:
                 weight_decay=self.config.weight_decay,
             )
         else:
-            raise NotImplementedError(
-                f"{self.config.optimizer} is not implemented. You can change the optimizer manually in trainer.py."
+            raise ValueError(
+                "{} is not implemented. You can change the optimizer manually in trainer.py."
             )
 
-        if initial_checkpoint["optimizer_state"] is not None:
-            print("Loading optimizer...\n")
-            self.optimizer.load_state_dict(
-                copy.deepcopy(initial_checkpoint["optimizer_state"])
-            )
-
-    def continuous_update_weights(self, replay_buffer, shared_storage):
+    def continuous_update_weights(self, replay_buffer, shared_storage_worker):
         # Wait for the replay buffer to be filled
-        while ray.get(shared_storage.get_info.remote("num_played_games")) < 1:
+        while ray.get(replay_buffer.get_self_play_count.remote()) < 1:
             time.sleep(0.1)
 
-        next_batch = replay_buffer.get_batch.remote()
         # Training loop
-        while self.training_step < self.config.training_steps and not ray.get(
-            shared_storage.get_info.remote("terminate")
-        ):
-            index_batch, batch = ray.get(next_batch)
-            next_batch = replay_buffer.get_batch.remote()
+        while True:
+            index_batch, batch = ray.get(
+                replay_buffer.get_batch.remote(self.model.get_weights())
+            )
             self.update_lr()
             (
                 priorities,
@@ -85,39 +71,24 @@ class Trainer:
 
             # Save to the shared storage
             if self.training_step % self.config.checkpoint_interval == 0:
-                shared_storage.set_info.remote(
-                    {
-                        "weights": copy.deepcopy(self.model.get_weights()),
-                        "optimizer_state": copy.deepcopy(
-                            models.dict_to_cpu(self.optimizer.state_dict())
-                        ),
-                    }
-                )
-                if self.config.save_model:
-                    shared_storage.save_checkpoint.remote()
-            shared_storage.set_info.remote(
-                {
-                    "training_step": self.training_step,
-                    "lr": self.optimizer.param_groups[0]["lr"],
-                    "total_loss": total_loss,
-                    "value_loss": value_loss,
-                    "reward_loss": reward_loss,
-                    "policy_loss": policy_loss,
-                }
+                shared_storage_worker.set_weights.remote(self.model.get_weights())
+            shared_storage_worker.set_infos.remote("training_step", self.training_step)
+            shared_storage_worker.set_infos.remote(
+                "lr", self.optimizer.param_groups[0]["lr"]
             )
+            shared_storage_worker.set_infos.remote("total_loss", total_loss)
+            shared_storage_worker.set_infos.remote("value_loss", value_loss)
+            shared_storage_worker.set_infos.remote("reward_loss", reward_loss)
+            shared_storage_worker.set_infos.remote("policy_loss", policy_loss)
 
             # Managing the self-play / training ratio
             if self.config.training_delay:
                 time.sleep(self.config.training_delay)
             if self.config.ratio:
                 while (
-                    self.training_step
-                    / max(
-                        1, ray.get(shared_storage.get_info.remote("num_played_steps"))
-                    )
-                    > self.config.ratio
-                    and self.training_step < self.config.training_steps
-                    and not ray.get(shared_storage.get_info.remote("terminate"))
+                    ray.get(replay_buffer.get_self_play_count.remote())
+                    / max(1, self.training_step)
+                    < self.config.ratio
                 ):
                     time.sleep(0.5)
 
@@ -132,28 +103,30 @@ class Trainer:
             target_value,
             target_reward,
             target_policy,
+            policy_actions_batch,
             weight_batch,
             gradient_scale_batch,
         ) = batch
 
         # Keep values as scalars for calculating the priorities for the prioritized replay
-        target_value_scalar = numpy.array(target_value, dtype="float32")
+        target_value_scalar = numpy.array(target_value, dtype=numpy.float32)
         priorities = numpy.zeros_like(target_value_scalar)
 
         device = next(self.model.parameters()).device
-        if self.config.PER:
-            weight_batch = torch.tensor(weight_batch.copy()).float().to(device)
+        weight_batch = torch.tensor(weight_batch.copy()).float().to(device)
         observation_batch = torch.tensor(observation_batch).float().to(device)
-        action_batch = torch.tensor(action_batch).long().to(device).unsqueeze(-1)
+        action_batch = torch.tensor(action_batch).float().to(device)
         target_value = torch.tensor(target_value).float().to(device)
         target_reward = torch.tensor(target_reward).float().to(device)
         target_policy = torch.tensor(target_policy).float().to(device)
+        policy_actions_batch = torch.tensor(policy_actions_batch).float().to(device)
         gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
         # observation_batch: batch, channels, height, width
-        # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
+        # observation_batch: batch, observation_shape
+        # action_batch: batch, num_unroll_steps+1, len(action_space) (unsqueeze)
         # target_value: batch, num_unroll_steps+1
         # target_reward: batch, num_unroll_steps+1
-        # target_policy: batch, num_unroll_steps+1, len(action_space)
+        # target_policy: batch, num_unroll_steps+1, child_nodes
         # gradient_scale_batch: batch, num_unroll_steps+1
 
         target_value = models.scalar_to_support(target_value, self.config.support_size)
@@ -164,17 +137,40 @@ class Trainer:
         # target_reward: batch, num_unroll_steps+1, 2*support_size+1
 
         ## Generate predictions
-        value, reward, policy_logits, hidden_state = self.model.initial_inference(
+        value, reward, policy_params, hidden_state = self.model.initial_inference(
             observation_batch
         )
-        predictions = [(value, reward, policy_logits)]
+
+        log_probs = []
+        action_len = len(self.config.action_space)
+        for batch_i in range(len(policy_actions_batch)):
+            log_probs.append(
+                models.get_log_prob(
+                    policy_params[batch_i, 0:action_len],
+                    policy_params[batch_i, action_len:action_len * 2],
+                    policy_actions_batch[batch_i, 0],
+                )
+            )
+
+        predictions = [(value, reward, torch.stack(log_probs))]
         for i in range(1, action_batch.shape[1]):
-            value, reward, policy_logits, hidden_state = self.model.recurrent_inference(
+            value, reward, policy_params, hidden_state = self.model.recurrent_inference(
                 hidden_state, action_batch[:, i]
             )
             # Scale the gradient at the start of the dynamics function (See paper appendix Training)
             hidden_state.register_hook(lambda grad: grad * 0.5)
-            predictions.append((value, reward, policy_logits))
+
+            log_probs = []
+            for batch_i in range(len(policy_actions_batch)):
+                log_probs.append(
+                    models.get_log_prob(
+                        policy_params[batch_i, 0:action_len],
+                        policy_params[batch_i, action_len:action_len * 2],
+                        policy_actions_batch[batch_i, i],
+                    )
+                )
+
+            predictions.append((value, reward, torch.stack(log_probs)))
         # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
 
         ## Compute losses
@@ -282,17 +278,12 @@ class Trainer:
 
     @staticmethod
     def loss_function(
-        value,
-        reward,
-        policy_logits,
-        target_value,
-        target_reward,
-        target_policy,
+        value, reward, policy_logits, target_value, target_reward, target_policy,
     ):
         # Cross-entropy seems to have a better convergence than MSE
         value_loss = (-target_value * torch.nn.LogSoftmax(dim=1)(value)).sum(1)
         reward_loss = (-target_reward * torch.nn.LogSoftmax(dim=1)(reward)).sum(1)
-        policy_loss = (-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits)).sum(
-            1
-        )
+        #expected reward * -log prob of actions
+        policy_loss = (-target_policy * policy_logits).sum(1)
+
         return value_loss, reward_loss, policy_loss
